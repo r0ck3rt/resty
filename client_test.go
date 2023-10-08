@@ -488,6 +488,17 @@ func TestClientOptions(t *testing.T) {
 	assertEqual(t, client.closeConnection, true)
 }
 
+func TestContentLengthWhenBodyIsNil(t *testing.T) {
+	client := dc()
+
+	client.SetPreRequestHook(func(c *Client, r *http.Request) error {
+		assertEqual(t, "0", r.Header.Get(hdrContentLengthKey))
+		return nil
+	})
+
+	client.R().SetContentLength(true).SetBody(nil).Get("http://localhost")
+}
+
 func TestClientPreRequestHook(t *testing.T) {
 	client := dc()
 	client.SetPreRequestHook(func(c *Client, r *http.Request) error {
@@ -537,6 +548,22 @@ func TestClientAllowsGetMethodPayload(t *testing.T) {
 
 	payload := "test-payload"
 	resp, err := c.R().SetBody(payload).Get(ts.URL + "/get-method-payload-test")
+
+	assertError(t, err)
+	assertEqual(t, http.StatusOK, resp.StatusCode())
+	assertEqual(t, payload, resp.String())
+}
+
+func TestClientAllowsGetMethodPayloadIoReader(t *testing.T) {
+	ts := createGetServer(t)
+	defer ts.Close()
+
+	c := dc()
+	c.SetAllowGetMethodPayload(true)
+
+	payload := "test-payload"
+	body := bytes.NewReader([]byte(payload))
+	resp, err := c.R().SetBody(body).Get(ts.URL + "/get-method-payload-test")
 
 	assertError(t, err)
 	assertEqual(t, http.StatusOK, resp.StatusCode())
@@ -695,12 +722,12 @@ func TestLogCallbacks(t *testing.T) {
 	c.outputLogTo(&lgr)
 
 	c.OnRequestLog(func(r *RequestLog) error {
-		// masking authorzation header
+		// masking authorization header
 		r.Header.Set("Authorization", "Bearer *******************************")
 		return nil
 	})
 	c.OnResponseLog(func(r *ResponseLog) error {
-		r.Header.Add("X-Debug-Resposne-Log", "Modified :)")
+		r.Header.Add("X-Debug-Response-Log", "Modified :)")
 		r.Body += "\nModified the response body content"
 		return nil
 	})
@@ -718,7 +745,7 @@ func TestLogCallbacks(t *testing.T) {
 	// Validating debug log updates
 	logInfo := lgr.String()
 	assertEqual(t, true, strings.Contains(logInfo, "Bearer *******************************"))
-	assertEqual(t, true, strings.Contains(logInfo, "X-Debug-Resposne-Log"))
+	assertEqual(t, true, strings.Contains(logInfo, "X-Debug-Response-Log"))
 	assertEqual(t, true, strings.Contains(logInfo, "Modified the response body content"))
 
 	// Error scenario
@@ -753,9 +780,6 @@ func TestNewWithLocalAddr(t *testing.T) {
 }
 
 func TestClientOnResponseError(t *testing.T) {
-	ts := createAuthServer(t)
-	defer ts.Close()
-
 	tests := []struct {
 		name        string
 		setup       func(*Client)
@@ -835,7 +859,12 @@ func TestClientOnResponseError(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ts := createAuthServer(t)
+			defer ts.Close()
+
 			var assertErrorHook = func(r *Request, err error) {
 				assertNotNil(t, r)
 				v, ok := err.(*ResponseError)
@@ -988,4 +1017,32 @@ func TestPostRedirectWithBody(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestUnixSocket(t *testing.T) {
+	unixSocketAddr := createUnixSocketEchoServer(t)
+	defer os.Remove(unixSocketAddr)
+
+	// Create a Go's http.Transport so we can set it in resty.
+	transport := http.Transport{
+		Dial: func(_, _ string) (net.Conn, error) {
+			return net.Dial("unix", unixSocketAddr)
+		},
+	}
+
+	// Create a Resty Client
+	client := New()
+
+	// Set the previous transport that we created, set the scheme of the communication to the
+	// socket and set the unixSocket as the HostURL.
+	client.SetTransport(&transport).SetScheme("http").SetHostURL(unixSocketAddr)
+
+	// No need to write the host's URL on the request, just the path.
+	res, err := client.R().Get("http://localhost/")
+	assertNil(t, err)
+	assertEqual(t, "Hi resty client from a server running on Unix domain socket!", res.String())
+
+	res, err = client.R().Get("http://localhost/hello")
+	assertNil(t, err)
+	assertEqual(t, "Hello resty client from a server running on endpoint /hello!", res.String())
 }

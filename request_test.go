@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type AuthSuccess struct {
@@ -45,6 +47,63 @@ func TestGet(t *testing.T) {
 	assertEqual(t, "TestGet: text response", resp.String())
 
 	logResponse(t, resp)
+}
+
+func TestGetGH524(t *testing.T) {
+	ts := createGetServer(t)
+	defer ts.Close()
+
+	resp, err := dc().R().
+		SetPathParams((map[string]string{
+			"userId":       "sample@sample.com",
+			"subAccountId": "100002",
+			"path":         "groups/developers",
+		})).
+		SetQueryParam("request_no", strconv.FormatInt(time.Now().Unix(), 10)).
+		SetDebug(true).
+		Get(ts.URL + "/v1/users/{userId}/{subAccountId}/{path}/details")
+
+	assertError(t, err)
+	assertEqual(t, http.StatusOK, resp.StatusCode())
+	assertEqual(t, resp.Request.Header.Get("Content-Type"), "") //  unable to reproduce reported issue
+}
+
+func TestRateLimiter(t *testing.T) {
+	ts := createGetServer(t)
+	defer ts.Close()
+
+	// Test a burst with a valid capacity and then a consecutive request that must fail.
+
+	// Allow a rate of 1 every 100 ms but also allow bursts of 10 requests.
+	client := dc().SetRateLimiter(rate.NewLimiter(rate.Every(100*time.Millisecond), 10))
+
+	// Execute a burst of 10 requests.
+	for i := 0; i < 10; i++ {
+		resp, err := client.R().
+			SetQueryParam("request_no", strconv.Itoa(i)).Get(ts.URL + "/")
+		assertError(t, err)
+		assertEqual(t, http.StatusOK, resp.StatusCode())
+	}
+	// Next request issued directly should fail because burst of 10 has been consumed.
+	{
+		_, err := client.R().
+			SetQueryParam("request_no", strconv.Itoa(11)).Get(ts.URL + "/")
+		assertErrorIs(t, ErrRateLimitExceeded, err)
+	}
+
+	// Test continues request at a valid rate
+
+	// Allow a rate of 1 every ms with no burst.
+	client = dc().SetRateLimiter(rate.NewLimiter(rate.Every(1*time.Millisecond), 1))
+
+	// Sending requests every ms+tiny delta must succeed.
+	for i := 0; i < 100; i++ {
+		resp, err := client.R().
+			SetQueryParam("request_no", strconv.Itoa(i)).Get(ts.URL + "/")
+		assertError(t, err)
+		assertEqual(t, http.StatusOK, resp.StatusCode())
+		time.Sleep(1*time.Millisecond + 100*time.Microsecond)
+	}
 }
 
 func TestIllegalRetryCount(t *testing.T) {
@@ -711,11 +770,11 @@ func TestFormDataDisableWarn(t *testing.T) {
 	c := dc()
 	c.SetFormData(map[string]string{"zip_code": "00000", "city": "Los Angeles"}).
 		SetContentLength(true).
-		SetDebug(true).
 		SetDisableWarn(true)
 	c.outputLogTo(io.Discard)
 
 	resp, err := c.R().
+		SetDebug(true).
 		SetFormData(map[string]string{"first_name": "Jeevanandam", "last_name": "M", "zip_code": "00001"}).
 		SetBasicAuth("myuser", "mypass").
 		Post(ts.URL + "/profile")
@@ -1169,7 +1228,7 @@ func TestPatchMethod(t *testing.T) {
 	assertError(t, err)
 	assertEqual(t, http.StatusOK, resp.StatusCode())
 
-	resp.body = nil
+	resp.SetBody(nil)
 	assertEqual(t, "", resp.String())
 }
 
@@ -1317,7 +1376,7 @@ func TestDetectContentTypeForPointer(t *testing.T) {
 }
 
 type ExampleUser struct {
-	FirstName string `json:"frist_name"`
+	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
 	ZipCode   string `json:"zip_code"`
 }
@@ -1636,7 +1695,7 @@ func TestGetPathParamAndPathParams(t *testing.T) {
 	defer ts.Close()
 
 	c := dc().
-		SetHostURL(ts.URL).
+		SetBaseURL(ts.URL).
 		SetPathParam("userId", "sample@sample.com")
 
 	resp, err := c.R().SetPathParam("subAccountId", "100002").
@@ -1744,26 +1803,101 @@ func TestHostHeaderOverride(t *testing.T) {
 	logResponse(t, resp)
 }
 
+type HTTPErrorResponse struct {
+	Error string `json:"error,omitempty"`
+}
+
+func TestNotFoundWithError(t *testing.T) {
+	var httpError HTTPErrorResponse
+	ts := createGetServer(t)
+	defer ts.Close()
+
+	resp, err := dc().R().
+		SetHeader(hdrContentTypeKey, "application/json").
+		SetError(&httpError).
+		Get(ts.URL + "/not-found-with-error")
+
+	assertError(t, err)
+	assertEqual(t, http.StatusNotFound, resp.StatusCode())
+	assertEqual(t, "404 Not Found", resp.Status())
+	assertNotNil(t, resp.Body())
+	assertEqual(t, "{\"error\": \"Not found\"}", resp.String())
+	assertNotNil(t, httpError)
+	assertEqual(t, "Not found", httpError.Error)
+
+	logResponse(t, resp)
+}
+
+func TestNotFoundWithoutError(t *testing.T) {
+	var httpError HTTPErrorResponse
+
+	ts := createGetServer(t)
+	defer ts.Close()
+
+	c := dc().outputLogTo(os.Stdout)
+	resp, err := c.R().
+		SetError(&httpError).
+		SetHeader(hdrContentTypeKey, "application/json").
+		Get(ts.URL + "/not-found-no-error")
+
+	assertError(t, err)
+	assertEqual(t, http.StatusNotFound, resp.StatusCode())
+	assertEqual(t, "404 Not Found", resp.Status())
+	assertNotNil(t, resp.Body())
+	assertEqual(t, 0, len(resp.Body()))
+	assertNotNil(t, httpError)
+	assertEqual(t, "", httpError.Error)
+
+	logResponse(t, resp)
+}
+
 func TestPathParamURLInput(t *testing.T) {
 	ts := createGetServer(t)
 	defer ts.Close()
 
-	c := dc().SetDebug(true).
-		SetHostURL(ts.URL).
+	c := dc().
+		SetBaseURL(ts.URL).
 		SetPathParams(map[string]string{
 			"userId": "sample@sample.com",
+			"path":   "users/developers",
 		})
 
 	resp, err := c.R().
+		SetDebug(true).
 		SetPathParams(map[string]string{
 			"subAccountId": "100002",
 			"website":      "https://example.com",
-		}).Get("/v1/users/{userId}/{subAccountId}/{website}")
+		}).Get("/v1/users/{userId}/{subAccountId}/{path}/{website}")
 
 	assertError(t, err)
 	assertEqual(t, http.StatusOK, resp.StatusCode())
 	assertEqual(t, true, strings.Contains(resp.String(), "TestPathParamURLInput: text response"))
-	assertEqual(t, true, strings.Contains(resp.String(), "/v1/users/sample@sample.com/100002/https:%2F%2Fexample.com"))
+	assertEqual(t, true, strings.Contains(resp.String(), "/v1/users/sample@sample.com/100002/users%2Fdevelopers/https:%2F%2Fexample.com"))
+
+	logResponse(t, resp)
+}
+
+func TestRawPathParamURLInput(t *testing.T) {
+	ts := createGetServer(t)
+	defer ts.Close()
+
+	c := dc().SetDebug(true).
+		SetBaseURL(ts.URL).
+		SetRawPathParams(map[string]string{
+			"userId": "sample@sample.com",
+			"path":   "users/developers",
+		})
+
+	resp, err := c.R().
+		SetRawPathParams(map[string]string{
+			"subAccountId": "100002",
+			"website":      "https://example.com",
+		}).Get("/v1/users/{userId}/{subAccountId}/{path}/{website}")
+
+	assertError(t, err)
+	assertEqual(t, http.StatusOK, resp.StatusCode())
+	assertEqual(t, true, strings.Contains(resp.String(), "TestPathParamURLInput: text response"))
+	assertEqual(t, true, strings.Contains(resp.String(), "/v1/users/sample@sample.com/100002/users/developers/https://example.com"))
 
 	logResponse(t, resp)
 }
@@ -1874,7 +2008,8 @@ func TestDebugLoggerRequestBodyTooLarge(t *testing.T) {
 
 	// upload a text file with no more than 512 bytes
 	output = bytes.NewBufferString("")
-	resp, err = New().SetDebug(true).outputLogTo(output).SetDebugBodyLimit(debugBodySizeLimit).R().
+	resp, err = New().outputLogTo(output).SetDebugBodyLimit(debugBodySizeLimit).R().
+		SetDebug(true).
 		SetFile("file", filepath.Join(getTestDataPath(), "text-file.txt")).
 		SetHeader("Content-Type", "text/plain").
 		Post(ts.URL + "/upload")
@@ -1901,7 +2036,8 @@ func TestDebugLoggerRequestBodyTooLarge(t *testing.T) {
 
 	// post form with no more than 512 bytes data
 	output = bytes.NewBufferString("")
-	resp, err = New().SetDebug(true).outputLogTo(output).SetDebugBodyLimit(debugBodySizeLimit).R().
+	resp, err = New().outputLogTo(output).SetDebugBodyLimit(debugBodySizeLimit).R().
+		SetDebug(true).
 		SetFormData(map[string]string{
 			"first_name": "Alex",
 			"last_name":  "C",
@@ -1928,7 +2064,8 @@ func TestDebugLoggerRequestBodyTooLarge(t *testing.T) {
 
 	// post slice with more than 512 bytes data
 	output = bytes.NewBufferString("")
-	resp, err = New().SetDebug(true).outputLogTo(output).SetDebugBodyLimit(debugBodySizeLimit).R().
+	resp, err = New().outputLogTo(output).SetDebugBodyLimit(debugBodySizeLimit).R().
+		SetDebug(true).
 		SetBody([]string{strings.Repeat("C", int(debugBodySizeLimit))}).
 		SetBasicAuth("myuser", "mypass").
 		Post(formTs.URL + "/profile")
